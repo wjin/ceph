@@ -522,6 +522,12 @@ int RGWOp::init_quota()
 
 static bool validate_cors_rule_method(RGWCORSRule *rule, const char *req_meth) {
   uint8_t flags = 0;
+
+  if (!req_meth) {
+    dout(5) << "req_meth is null" << dendl;
+    return false;
+  }
+
   if (strcmp(req_meth, "GET") == 0) flags = RGW_CORS_GET;
   else if (strcmp(req_meth, "POST") == 0) flags = RGW_CORS_POST;
   else if (strcmp(req_meth, "PUT") == 0) flags = RGW_CORS_PUT;
@@ -627,11 +633,12 @@ bool RGWOp::generate_cors_headers(string& origin, string& method, string& header
     req_meth = s->info.method;
   }
 
-  if (req_meth)
+  if (req_meth) {
     method = req_meth;
-  /* CORS 6.2.5. */
-  if (!validate_cors_rule_method(rule, req_meth)) {
-    return false;
+    /* CORS 6.2.5. */
+    if (!validate_cors_rule_method(rule, req_meth)) {
+     return false;
+    }
   }
 
   /* CORS 6.2.4. */
@@ -2050,11 +2057,24 @@ void RGWPutMetadata::execute()
     }
   }
 
-  /* only remove meta attrs */
   for (iter = orig_attrs.begin(); iter != orig_attrs.end(); ++iter) {
     const string& name = iter->first;
+    /* check if the attr is user-defined metadata item */
     if (name.compare(0, meta_prefix_len, meta_prefix) == 0) {
-      rmattrs[name] = iter->second;
+      if (is_object_op) {
+        /* for the objects all existing meta attrs have to be removed */
+        rmattrs[name] = iter->second;
+      } else {
+        /* for the buckets all existing meta attrs are preserved,
+           except those that are listed in rmattr_names. */
+        if (rmattr_names.find(name) != rmattr_names.end()) {
+          map<string, bufferlist>::iterator aiter = attrs.find(name);
+          if (aiter != attrs.end()) {
+            attrs.erase(aiter);
+          }
+          rmattrs[name] = iter->second;
+        }
+      }
     } else if (attrs.find(name) == attrs.end()) {
       attrs[name] = iter->second;
     }
@@ -3099,7 +3119,15 @@ void RGWAbortMultipart::execute()
   int marker = 0;
   int max_parts = 1000;
 
+
   RGWObjectCtx *obj_ctx = (RGWObjectCtx *)s->obj_ctx;
+
+  meta_obj.init_ns(s->bucket, meta_oid, mp_ns);
+  meta_obj.set_in_extra_data(true);
+  meta_obj.index_hash_source = s->object.name;
+
+  cls_rgw_obj_chain chain;
+  list<rgw_obj_key> remove_objs;
 
   do {
     ret = list_multipart_parts(store, s, upload_id, meta_oid, max_parts, marker, obj_parts, &marker, &truncated);
@@ -3118,24 +3146,36 @@ void RGWAbortMultipart::execute()
         if (ret < 0 && ret != -ENOENT)
           return;
       } else {
-        RGWObjManifest& manifest = obj_part.manifest;
-        RGWObjManifest::obj_iterator oiter;
-        for (oiter = manifest.obj_begin(); oiter != manifest.obj_end(); ++oiter) {
-          rgw_obj loc = oiter.get_location();
-          loc.index_hash_source = s->object.name;
-          ret = store->delete_obj(*obj_ctx, s->bucket_info, loc, 0);
-          if (ret < 0 && ret != -ENOENT)
-            return;
+        store->update_gc_chain(meta_obj, obj_part.manifest, &chain);
+        RGWObjManifest::obj_iterator oiter = obj_part.manifest.obj_begin();
+        if (oiter != obj_part.manifest.obj_end()) {
+          rgw_obj head = oiter.get_location();
+          rgw_obj_key key;
+          head.get_index_key(&key);
+          remove_objs.push_back(key);
         }
       }
     }
   } while (truncated);
 
+  /* use upload id as tag */
+  ret = store->send_chain_to_gc(chain, upload_id , false);  // do it async
+  if (ret < 0) {
+    ldout(store->ctx(), 5) << "gc->send_chain() returned " << ret << dendl;
+    return;
+  }
+
+  RGWRados::Object del_target(store, s->bucket_info, *obj_ctx, meta_obj);
+  RGWRados::Object::Delete del_op(&del_target);
+
+  del_op.params.bucket_owner = s->bucket_info.owner;
+  del_op.params.versioning_status = 0;
+  if (!remove_objs.empty()) {
+    del_op.params.remove_objs = &remove_objs;
+  }
+
   // and also remove the metadata obj
-  meta_obj.init_ns(s->bucket, meta_oid, mp_ns);
-  meta_obj.set_in_extra_data(true);
-  meta_obj.index_hash_source = s->object.name;
-  ret = store->delete_obj(*obj_ctx, s->bucket_info, meta_obj, 0);
+  ret = del_op.delete_obj();
   if (ret == -ENOENT) {
     ret = -ERR_NO_SUCH_BUCKET;
   }

@@ -38,7 +38,7 @@ public:
       return -ERESTART;
     }
 
-    RWLock::RLocker l2(m_image_ctx.md_lock);
+    RWLock::RLocker l2(m_image_ctx.snap_lock);
     uint64_t overlap;
     {
       RWLock::RLocker l3(m_image_ctx.parent_lock);
@@ -49,7 +49,10 @@ public:
       }
 
       // resize might have occurred while flatten is running
-      overlap = min(m_image_ctx.size, m_image_ctx.parent_md.overlap);
+      uint64_t parent_overlap;
+      int r = m_image_ctx.get_parent_overlap(CEPH_NOSNAP, &parent_overlap);
+      assert(r == 0);
+      overlap = min(m_image_ctx.size, parent_overlap);
     }
 
     // map child object onto the parent
@@ -119,7 +122,7 @@ void AsyncFlattenRequest::send() {
       boost::lambda::_1, &m_image_ctx, m_object_size, m_snapc,
       boost::lambda::_2));
   AsyncObjectThrottle *throttle = new AsyncObjectThrottle(
-    context_factory, create_callback_context(), m_prog_ctx, 0,
+    *this, context_factory, create_callback_context(), m_prog_ctx, 0,
     m_overlap_objects);
   throttle->start_ops(cct->_conf->rbd_concurrent_management_ops);
 }

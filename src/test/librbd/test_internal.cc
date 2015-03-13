@@ -1,6 +1,7 @@
 // -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 #include "test/librbd/test_fixture.h"
+#include "librbd/AioCompletion.h"
 #include "librbd/ImageWatcher.h"
 #include "librbd/internal.h"
 #include <boost/scope_exit.hpp>
@@ -260,8 +261,7 @@ TEST_F(TestInternal, AioWriteRequestsLock) {
   bool is_owner;
   ASSERT_EQ(0, librbd::is_exclusive_lock_owner(ictx, &is_owner));
   ASSERT_FALSE(is_owner);
-
-  ASSERT_TRUE(ictx->image_watcher->has_pending_aio_operations());
+  ASSERT_FALSE(c->is_complete());
 }
 
 TEST_F(TestInternal, AioDiscardRequestsLock) {
@@ -279,6 +279,85 @@ TEST_F(TestInternal, AioDiscardRequestsLock) {
   bool is_owner;
   ASSERT_EQ(0, librbd::is_exclusive_lock_owner(ictx, &is_owner));
   ASSERT_FALSE(is_owner);
+  ASSERT_FALSE(c->is_complete());
+}
 
-  ASSERT_TRUE(ictx->image_watcher->has_pending_aio_operations());
+TEST_F(TestInternal, CancelAsyncResize) {
+  REQUIRE_FEATURE(RBD_FEATURE_EXCLUSIVE_LOCK);
+
+  librbd::ImageCtx *ictx;
+  ASSERT_EQ(0, open_image(m_image_name, &ictx));
+
+  {
+    RWLock::WLocker l(ictx->owner_lock);
+    ASSERT_EQ(0, ictx->image_watcher->try_lock());
+    ASSERT_TRUE(ictx->image_watcher->is_lock_owner());
+  }
+
+  uint64_t size;
+  ASSERT_EQ(0, librbd::get_size(ictx, &size));
+
+  uint32_t attempts = 0;
+  while (attempts++ < 20 && size > 0) {
+    C_SaferCond ctx;
+    librbd::NoOpProgressContext prog_ctx;
+
+    size -= MIN(size, 1<<18);
+    {
+      RWLock::RLocker l(ictx->owner_lock);
+      ASSERT_EQ(0, librbd::async_resize(ictx, &ctx, size, prog_ctx));
+    }
+
+    // try to interrupt the in-progress resize
+    ictx->cancel_async_requests();
+
+    int r = ctx.wait();
+    if (r == -ERESTART) {
+      std::cout << "detected canceled async request" << std::endl;
+      break;
+    }
+    ASSERT_EQ(0, r);
+  }
+}
+
+TEST_F(TestInternal, MultipleResize) {
+  librbd::ImageCtx *ictx;
+  ASSERT_EQ(0, open_image(m_image_name, &ictx));
+
+  {
+    RWLock::WLocker l(ictx->owner_lock);
+    if (ictx->image_watcher->is_lock_supported()) {
+      ASSERT_EQ(0, ictx->image_watcher->try_lock());
+      ASSERT_TRUE(ictx->image_watcher->is_lock_owner());
+    }
+  }
+
+  uint64_t size;
+  ASSERT_EQ(0, librbd::get_size(ictx, &size));
+  uint64_t original_size = size;
+
+  std::vector<C_SaferCond*> contexts;
+
+  uint32_t attempts = 0;
+  librbd::NoOpProgressContext prog_ctx;
+  while (size > 0) {
+    uint64_t new_size = original_size;
+    if (attempts++ % 2 == 0) {
+      size -= MIN(size, 1<<18);
+      new_size = size;
+    }
+
+    RWLock::RLocker l(ictx->owner_lock);
+    contexts.push_back(new C_SaferCond());
+    ASSERT_EQ(0, librbd::async_resize(ictx, contexts.back(), new_size,
+                                      prog_ctx));
+  }
+
+  for (uint32_t i = 0; i < contexts.size(); ++i) {
+    ASSERT_EQ(0, contexts[i]->wait());
+    delete contexts[i];
+  }
+
+  ASSERT_EQ(0, librbd::get_size(ictx, &size));
+  ASSERT_EQ(0U, size);
 }

@@ -1045,10 +1045,9 @@ int main(int argc, const char **argv)
   RGWRados *store = RGWStoreManager::get_storage(g_ceph_context, true, true);
   if (!store) {
     derr << "Couldn't init storage provider (RADOS)" << dendl;
-    r = EIO;
+    return EIO;
   }
-  if (!r)
-    r = rgw_perf_start(g_ceph_context);
+  r = rgw_perf_start(g_ceph_context);
 
   rgw_rest_init(g_ceph_context, store->region);
 
@@ -1060,7 +1059,7 @@ int main(int argc, const char **argv)
   if (r) 
     return 1;
 
-  rgw_user_init(store->meta_mgr);
+  rgw_user_init(store);
   rgw_bucket_init(store->meta_mgr);
   rgw_log_usage_init(g_ceph_context, store);
 
@@ -1220,13 +1219,13 @@ int main(int argc, const char **argv)
 
   delete olog;
 
-  rgw_perf_stop(g_ceph_context);
-
   RGWStoreManager::close_storage(store);
 
   rgw_tools_cleanup();
   rgw_shutdown_resolver();
   curl_global_cleanup();
+
+  rgw_perf_stop(g_ceph_context);
 
   dout(1) << "final shutdown" << dendl;
   g_ceph_context->put();
